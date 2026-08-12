@@ -85,6 +85,12 @@
   input:focus, textarea:focus{
     outline: 2px solid var(--yellow); outline-offset: 1px; border-color: transparent;
   }
+  .remember-row{
+    display:flex; align-items:center; gap:8px; margin-top:10px;
+    font-size:.83rem; color: var(--text); text-transform:none; letter-spacing:normal; font-weight:400;
+    cursor:pointer;
+  }
+  .remember-row input{ width:15px; height:15px; accent-color: var(--yellow); cursor:pointer; }
   .hint{ font-size:.8rem; color: var(--muted); margin-top:8px; line-height:1.5; }
   .hint code{ background: var(--panel-2); padding: 1px 6px; border-radius: 4px; font-family:'JetBrains Mono', monospace; }
 
@@ -159,8 +165,12 @@
   <section class="panel">
     <div class="field">
       <label for="apiKey">Rebrickable API key</label>
-      <input type="password" id="apiKey" placeholder="Paste your key &mdash; used only in this browser tab" autocomplete="off">
-      <p class="hint">Not saved anywhere. You'll need to paste it again next time you open this page. Get one free at <span class="hint" style="display:inline">rebrickable.com/api</span>.</p>
+      <input type="password" id="apiKey" placeholder="Paste your key" autocomplete="off">
+      <label class="remember-row" for="rememberKey">
+        <input type="checkbox" id="rememberKey">
+        <span>Remember my key on this device</span>
+      </label>
+      <p class="hint">Get a free key at <span class="hint" style="display:inline">rebrickable.com/api</span>. If "remember" is off, you'll need to paste it again next time.</p>
     </div>
 
     <div class="field">
@@ -190,11 +200,47 @@
 <script>
 (function(){
   const apiKeyInput = document.getElementById('apiKey');
+  const rememberKey = document.getElementById('rememberKey');
   const idsInput = document.getElementById('idsInput');
   const convertBtn = document.getElementById('convertBtn');
   const clearBtn = document.getElementById('clearBtn');
   const statusLine = document.getElementById('statusLine');
   const outputArea = document.getElementById('outputArea');
+
+  const STORAGE_KEY = 'bricklinkConverter.rebrickableApiKey';
+
+  // Storage can be unavailable (private browsing, some preview sandboxes) -
+  // fail quietly rather than breaking the page.
+  function storageGet(){
+    try{ return window.localStorage.getItem(STORAGE_KEY); }
+    catch(err){ return null; }
+  }
+  function storageSet(value){
+    try{ window.localStorage.setItem(STORAGE_KEY, value); }
+    catch(err){ /* ignore - remembering is a nice-to-have, not required */ }
+  }
+  function storageClear(){
+    try{ window.localStorage.removeItem(STORAGE_KEY); }
+    catch(err){ /* ignore */ }
+  }
+
+  const savedKey = storageGet();
+  if (savedKey){
+    apiKeyInput.value = savedKey;
+    rememberKey.checked = true;
+  }
+
+  rememberKey.addEventListener('change', function(){
+    if (rememberKey.checked){
+      if (apiKeyInput.value.trim()) storageSet(apiKeyInput.value.trim());
+    } else {
+      storageClear();
+    }
+  });
+
+  apiKeyInput.addEventListener('input', function(){
+    if (rememberKey.checked) storageSet(apiKeyInput.value.trim());
+  });
 
   clearBtn.addEventListener('click', function(){
     idsInput.value = '';
