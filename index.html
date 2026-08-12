@@ -176,7 +176,7 @@
     <div class="field">
       <label for="idsInput">Element IDs and quantities</label>
       <textarea id="idsInput" placeholder="6248944 x1&#10;6319336 x1&#10;6335378 x1&#10;6221607 x2&#10;6590266 x1&#10;4570877 x1"></textarea>
-      <p class="hint">One entry per line. Accepts <code>6248944 x1</code>, <code>1x6248944</code>, or <code>6248944x1</code> &mdash; order and spacing don't matter.</p>
+      <p class="hint">One entry per line. Accepts <code>6248944 x1</code>, <code>1x6248944</code>, <code>x2 6248944</code>, or <code>6248944*2</code> &mdash; order, spacing, and <code>x</code>/<code>*</code> don't matter.</p>
     </div>
 
     <div class="btn-row">
@@ -251,19 +251,43 @@
   function parseLine(line){
     line = line.trim();
     if (!line) return null;
-    const parts = line.split(/[xX]/).map(s => s.trim()).filter(Boolean);
-    if (parts.length === 1){
-      if (!/^\d+$/.test(parts[0])) return null;
-      return { elementId: parts[0], qty: 1 };
+
+    // Step 1: look for a quantity glued directly to a multiplier symbol
+    // (x, X, or *) with no space on that side ("x3", "3x", "*3", "3*",
+    // "Order 12: x3 6181720"). Being glued is what marks it as a quantity
+    // rather than just a separator - it's a strong enough signal to trust
+    // even alongside other stray numbers on the line (order numbers, row
+    // numbers, etc.).
+    const glued = line.match(/(?:^|\s)[xX*](\d+)\b/) || line.match(/\b(\d+)[xX*](?:\s|$)/);
+    if (glued){
+      const qty = parseInt(glued[1], 10);
+      const rest = line.slice(0, glued.index) + line.slice(glued.index + glued[0].length);
+      const remaining = rest.match(/\d+/g);
+      if (!remaining || !remaining.length) return null;
+      const elementId = remaining.reduce((a, b) => (b.length > a.length ? b : a));
+      return { elementId, qty: qty > 0 ? qty : 1 };
     }
-    if (parts.length === 2){
-      const [a, b] = parts;
-      if (!/^\d+$/.test(a) || !/^\d+$/.test(b)) return null;
+
+    // Step 2: no glued marker - fall back to "however many numbers are on
+    // this line, ignoring whatever separates them". A lone number is the
+    // ID with an implied quantity of 1; two numbers means the longer one
+    // (element IDs run 6-7 digits) is the ID and the shorter is the
+    // quantity, in either order and with any punctuation between them
+    // ("2 x 6181720", "qty 2, id 6181720", "6181720 (2 needed)", etc.).
+    const allNumbers = line.match(/\d+/g) || [];
+    if (allNumbers.length === 1){
+      return { elementId: allNumbers[0], qty: 1 };
+    }
+    if (allNumbers.length === 2){
+      const [a, b] = allNumbers;
       const elementId = a.length >= b.length ? a : b;
       const qtyStr = a.length >= b.length ? b : a;
       const qty = parseInt(qtyStr, 10);
       return { elementId, qty: qty > 0 ? qty : 1 };
     }
+
+    // Three or more bare numbers with no quantity marker to anchor on is
+    // too ambiguous to guess safely - flag it for a manual look instead.
     return null;
   }
 
