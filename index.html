@@ -176,7 +176,7 @@
     <div class="field">
       <label for="idsInput">Element IDs and quantities</label>
       <textarea id="idsInput" placeholder="6248944 x1&#10;6319336 x1&#10;6335378 x1&#10;6221607 x2&#10;6590266 x1&#10;4570877 x1"></textarea>
-      <p class="hint">One entry per line. Accepts <code>6248944 x1</code>, <code>1x6248944</code>, <code>x2 6248944</code>, or <code>6248944*2</code> &mdash; order, spacing, and <code>x</code>/<code>*</code> don't matter.</p>
+      <p class="hint">One entry per line, or paste them all comma-separated on one line &mdash; both work. Accepts <code>6248944 x1</code>, <code>1x6248944</code>, <code>x2 6248944</code>, or <code>6248944*2</code>; order, spacing, and <code>x</code>/<code>*</code> don't matter.</p>
     </div>
 
     <div class="btn-row">
@@ -336,8 +336,8 @@
     }).join('');
 
     const summary = unresolvedCount
-      ? unresolvedCount + ' of ' + rows.length + ' line(s) need a manual look-up on BrickLink.'
-      : 'All lines matched cleanly.';
+      ? unresolvedCount + ' of ' + rows.length + ' entries need a manual look-up on BrickLink.'
+      : 'All entries matched cleanly.';
 
     outputArea.innerHTML =
       '<p class="hint" style="margin-bottom:14px">' + summary + '</p>' +
@@ -370,18 +370,26 @@
 
   convertBtn.addEventListener('click', async function(){
     const apiKey = apiKeyInput.value.trim();
-    const rawLines = idsInput.value.split(/\r?\n/);
 
     if (!apiKey){
       statusLine.textContent = 'Add your Rebrickable API key first.';
       return;
     }
 
-    const parsedLines = [];
-    rawLines.forEach(function(line){
-      if (!line.trim()) return;
-      const parsed = parseLine(line);
-      parsedLines.push({ line: line.trim(), parsed });
+    // Break the input into individual entries. Lines are one boundary;
+    // commas are another - this way a single pasted line like
+    // "302401x4, 654101x2, 6536331x2" is treated the same as one entry
+    // per line.
+    const entries = [];
+    idsInput.value.split(/\r?\n/).forEach(function(line){
+      line.split(',').forEach(function(token){
+        const trimmed = token.trim();
+        if (trimmed) entries.push(trimmed);
+      });
+    });
+
+    const parsedLines = entries.map(function(entry){
+      return { line: entry, parsed: parseLine(entry) };
     });
 
     if (!parsedLines.length){
