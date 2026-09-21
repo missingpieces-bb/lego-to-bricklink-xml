@@ -1,1 +1,3 @@
-Just drop in your lego IDs and their quantities.
+LEGO ID to XML Converter.
+
+Made by Robert Sillett.
