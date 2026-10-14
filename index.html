@@ -129,6 +129,18 @@
   .tag{ display:inline-block; padding:2px 8px; border-radius:20px; font-size:.72rem; font-weight:600; }
   .tag-ok{ background: rgba(79,180,119,.15); color: var(--green); }
   .tag-fail{ background: rgba(232,67,58,.15); color: var(--red); }
+  .tag-warn{ background: rgba(255,196,0,.15); color: var(--yellow); }
+  .btn-retry{
+    margin-left: 8px; padding: 2px 10px; font-size: .72rem; border-radius: 20px;
+    background: transparent; color: var(--yellow); border: 1px solid var(--yellow);
+  }
+  .btn-retry:disabled{ opacity:.4; cursor:not-allowed; }
+  .warn-box{
+    border: 1px solid var(--yellow); background: rgba(255,196,0,.08); color: var(--text);
+    border-radius: 8px; padding: 12px 14px; margin-bottom: 14px; font-size: .88rem; line-height: 1.5;
+    display:flex; gap:12px; align-items:center; justify-content:space-between; flex-wrap:wrap;
+  }
+  .warn-box button{ padding: 8px 14px; font-size: .85rem; }
 
   pre.xml{
     background: var(--panel);
@@ -243,6 +255,8 @@
   });
 
   clearBtn.addEventListener('click', function(){
+    if (busy) return;
+    lastRun = null;
     idsInput.value = '';
     outputArea.innerHTML = '<div class="out-empty">Your Wanted List XML and a per-line lookup report will show up here after you convert.</div>';
     statusLine.textContent = '';
@@ -291,24 +305,50 @@
     return null;
   }
 
+  // Gap between lookups. Rebrickable allows ~1 request/sec on average with a
+  // small burst allowance, so this runs fast for short lists and only
+  // occasionally trips the limit on long ones - which the backoff below
+  // handles by waiting the time Rebrickable asks for.
+  const PACE_MS = 150;
+  // How many times one lookup is attempted when it hits a temporary error
+  // (429 or network) before it's left for the user to retry by hand.
+  const MAX_ATTEMPTS = 3;
+
+  let busy = false;     // true while a convert or retry is running
+  let lastRun = null;   // { rows } from the most recent convert, kept so retries can rebuild the XML
+
   async function lookupElement(elementId, apiKey){
     const url = 'https://rebrickable.com/api/v3/lego/elements/' + encodeURIComponent(elementId) + '/?key=' + encodeURIComponent(apiKey);
     let res;
     try{
       res = await fetch(url);
     }catch(err){
-      return { ok:false, reason: 'Network error contacting Rebrickable' };
+      return { ok:false, reason: 'Network error contacting Rebrickable', retryable:true, waitMs: 1000, short:'network error' };
     }
     if (res.status === 401 || res.status === 403){
       return { ok:false, reason: 'API key rejected', fatal:true };
     }
     if (res.status === 429){
-      return { ok:false, reason: 'Rate limited by Rebrickable' };
+      // Rebrickable puts the wait in the body: {"detail": "Request was
+      // throttled. Expected available in 2 seconds."}. The Retry-After header
+      // isn't readable cross-origin, so the body is the only reliable source.
+      let waitMs = 2000;
+      try{
+        const body = await res.json();
+        const m = body && body.detail && String(body.detail).match(/(\d+)\s*second/i);
+        if (m) waitMs = parseInt(m[1], 10) * 1000;
+      }catch(err){ /* keep the default */ }
+      return { ok:false, reason: 'Rate limited by Rebrickable', retryable:true, waitMs, short:'rate limited' };
     }
     if (!res.ok){
       return { ok:false, reason: 'No such element ID' };
     }
-    const data = await res.json();
+    let data;
+    try{
+      data = await res.json();
+    }catch(err){
+      return { ok:false, reason: 'Unreadable response from Rebrickable', retryable:true, waitMs: 1000, short:'bad response' };
+    }
     const blPart = data.part && data.part.external_ids && data.part.external_ids.BrickLink;
     const blColor = data.color && data.color.external_ids && data.color.external_ids.BrickLink;
     if (!blPart || !blPart.length){
@@ -320,27 +360,86 @@
     return { ok:true, blPartId: blPart[0], blColorId: blColor.ext_ids[0] };
   }
 
+  // Look an element up, and if Rebrickable says "slow down" (or the network
+  // blips), wait the time it asks for and try again rather than moving on.
+  // Continuing to fire requests while throttled is what risks an IP ban.
+  async function lookupWithBackoff(elementId, apiKey, progressText){
+    let result;
+    for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++){
+      result = await lookupElement(elementId, apiKey);
+      if (!result.retryable || attempt === MAX_ATTEMPTS) return result;
+      const wait = Math.min(result.waitMs + 500, 30000);
+      statusLine.textContent = progressText + ' — ' + result.short + ', waiting ' +
+        Math.ceil(wait / 1000) + 's before retry ' + attempt + ' of ' + (MAX_ATTEMPTS - 1) + '…';
+      await sleep(wait);
+    }
+    return result;
+  }
+
   function xmlEscape(str){
     return String(str).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
   }
 
   function sleep(ms){ return new Promise(r => setTimeout(r, ms)); }
 
-  function renderResults(rows, xml, unresolvedCount){
-    const reportRows = rows.map(r => {
-      const tag = r.ok
-        ? '<span class="tag tag-ok">OK</span>'
-        : '<span class="tag tag-fail">' + xmlEscape(r.reason) + '</span>';
-      const mapped = r.ok ? (r.blPartId + ' / colour ' + r.blColorId) : '&mdash;';
-      return '<tr><td>' + xmlEscape(r.line) + '</td><td>' + tag + '</td><td>' + mapped + '</td></tr>';
+  function buildXml(rows){
+    const aggregated = {};
+    rows.forEach(function(r){
+      if (!r.ok) return;
+      const key = r.blPartId + '|' + r.blColorId;
+      aggregated[key] = (aggregated[key] || 0) + r.parsed.qty;
+    });
+    let xml = '<INVENTORY>\n';
+    Object.keys(aggregated).forEach(function(key){
+      const [partId, colorId] = key.split('|');
+      xml += '<ITEM>\n';
+      xml += '<ITEMTYPE>P</ITEMTYPE>\n';
+      xml += '<ITEMID>' + xmlEscape(partId) + '</ITEMID>\n';
+      xml += '<COLOR>' + xmlEscape(colorId) + '</COLOR>\n';
+      xml += '<MINQTY>' + aggregated[key] + '</MINQTY>\n';
+      xml += '</ITEM>\n';
+    });
+    xml += '</INVENTORY>';
+    return xml;
+  }
+
+  function renderResults(){
+    const rows = lastRun.rows;
+    const xml = buildXml(rows);
+    const retryable = rows.filter(r => r.retryable).length;
+    const unresolved = rows.filter(r => !r.ok).length;
+    const hardFails = unresolved - retryable;
+
+    const reportRows = rows.map(function(r, i){
+      let status;
+      if (r.ok){
+        status = '<span class="tag tag-ok">OK</span>';
+      } else if (r.retryable){
+        status = '<span class="tag tag-warn">' + xmlEscape(r.reason) + '</span>' +
+          '<button class="btn-retry" data-retry="' + i + '"' + (busy ? ' disabled' : '') + '>' +
+          (r.retrying ? 'Retrying…' : 'Retry') + '</button>';
+      } else {
+        status = '<span class="tag tag-fail">' + xmlEscape(r.reason) + '</span>';
+      }
+      const mapped = r.ok ? (xmlEscape(r.blPartId) + ' / colour ' + xmlEscape(r.blColorId)) : '&mdash;';
+      return '<tr><td>' + xmlEscape(r.line) + '</td><td>' + status + '</td><td>' + mapped + '</td></tr>';
     }).join('');
 
-    const summary = unresolvedCount
-      ? unresolvedCount + ' of ' + rows.length + ' entries need a manual look-up on BrickLink.'
-      : 'All entries matched cleanly.';
+    // Temporary failures get a loud banner: they are NOT in the XML, and
+    // they'll almost always succeed on a retry.
+    const warn = retryable
+      ? '<div class="warn-box"><span><strong>' + retryable + ' ' + (retryable === 1 ? 'entry is' : 'entries are') +
+        ' missing from the XML</strong> because of a temporary Rebrickable error. Retry before downloading.</span>' +
+        '<button class="btn-primary" data-retry="all"' + (busy ? ' disabled' : '') + '>Retry all (' + retryable + ')</button></div>'
+      : '';
+
+    const summary = hardFails
+      ? hardFails + ' of ' + rows.length + ' entries need a manual look-up on BrickLink.'
+      : (retryable ? '' : 'All entries matched cleanly.');
 
     outputArea.innerHTML =
-      '<p class="hint" style="margin-bottom:14px">' + summary + '</p>' +
+      warn +
+      (summary ? '<p class="hint" style="margin-bottom:14px">' + summary + '</p>' : '') +
       '<table class="report"><thead><tr><th>Input</th><th>Status</th><th>BrickLink match</th></tr></thead>' +
       '<tbody>' + reportRows + '</tbody></table>' +
       '<label>Wanted List XML</label>' +
@@ -368,7 +467,68 @@
     });
   }
 
+  function setBusy(value){
+    busy = value;
+    convertBtn.disabled = value;
+    clearBtn.disabled = value;
+  }
+
+  // Re-run the lookup for the given rows. Rows sharing an element ID are
+  // looked up once and all updated together.
+  async function retryRows(indices){
+    if (busy || !lastRun) return;
+    const apiKey = apiKeyInput.value.trim();
+    if (!apiKey){
+      statusLine.textContent = 'Add your Rebrickable API key first.';
+      return;
+    }
+    const rows = lastRun.rows;
+    const ids = [...new Set(indices.map(i => rows[i]).filter(r => r && r.retryable).map(r => r.parsed.elementId))];
+    if (!ids.length) return;
+
+    setBusy(true);
+    rows.forEach(r => { if (r.retryable && ids.includes(r.parsed.elementId)) r.retrying = true; });
+    renderResults();
+
+    let fatal = null;
+    for (let n = 0; n < ids.length; n++){
+      const id = ids[n];
+      const progress = 'Retrying ' + (n + 1) + ' of ' + ids.length;
+      statusLine.textContent = progress + '…';
+      const result = await lookupWithBackoff(id, apiKey, progress);
+      if (result.fatal){ fatal = result; break; }
+      rows.forEach(function(r, i){
+        if (r.retryable && r.parsed.elementId === id){
+          rows[i] = Object.assign({ line: r.line, parsed: r.parsed }, result);
+        }
+      });
+      renderResults();
+      if (n < ids.length - 1) await sleep(PACE_MS);
+    }
+
+    rows.forEach(r => { delete r.retrying; });
+    setBusy(false);
+    renderResults();
+
+    const stillFailing = rows.filter(r => r.retryable).length;
+    statusLine.textContent = fatal
+      ? fatal.reason + ' — check your API key and try again.'
+      : (stillFailing ? stillFailing + ' still rate limited — give it a few seconds and retry.' : 'Retry done — XML updated.');
+  }
+
+  // One listener for every Retry button, including ones added by re-renders.
+  outputArea.addEventListener('click', function(e){
+    const btn = e.target.closest('[data-retry]');
+    if (!btn || !lastRun) return;
+    const which = btn.getAttribute('data-retry');
+    const indices = which === 'all'
+      ? lastRun.rows.map((r, i) => r.retryable ? i : -1).filter(i => i >= 0)
+      : [parseInt(which, 10)];
+    retryRows(indices);
+  });
+
   convertBtn.addEventListener('click', async function(){
+    if (busy) return;
     const apiKey = apiKeyInput.value.trim();
 
     if (!apiKey){
@@ -397,60 +557,42 @@
       return;
     }
 
-    convertBtn.disabled = true;
+    setBusy(true);
     const cache = {};
     const rows = [];
-    let unresolvedCount = 0;
-    const aggregated = {};
 
     for (let i = 0; i < parsedLines.length; i++){
       const { line, parsed } = parsedLines[i];
-      statusLine.textContent = 'Looking up ' + (i+1) + ' of ' + parsedLines.length + '\u2026';
+      const progress = 'Looking up ' + (i+1) + ' of ' + parsedLines.length;
+      statusLine.textContent = progress + '…';
 
       if (!parsed){
-        rows.push({ line, ok:false, reason:'Could not parse line' });
-        unresolvedCount++;
+        rows.push({ line, parsed: null, ok:false, reason:'Could not parse line' });
         continue;
       }
 
       if (!(parsed.elementId in cache)){
-        cache[parsed.elementId] = await lookupElement(parsed.elementId, apiKey);
-        await sleep(150);
+        cache[parsed.elementId] = await lookupWithBackoff(parsed.elementId, apiKey, progress);
+        await sleep(PACE_MS);
       }
       const result = cache[parsed.elementId];
 
       if (result.fatal){
-        statusLine.textContent = result.reason + ' \u2014 check your API key and try again.';
-        convertBtn.disabled = false;
+        statusLine.textContent = result.reason + ' — check your API key and try again.';
+        setBusy(false);
         return;
       }
 
-      if (!result.ok){
-        rows.push({ line, ok:false, reason: result.reason });
-        unresolvedCount++;
-        continue;
-      }
-
-      rows.push({ line, ok:true, blPartId: result.blPartId, blColorId: result.blColorId });
-      const key = result.blPartId + '|' + result.blColorId;
-      aggregated[key] = (aggregated[key] || 0) + parsed.qty;
+      rows.push(Object.assign({ line, parsed }, result));
     }
 
-    let xml = '<INVENTORY>\n';
-    Object.keys(aggregated).forEach(function(key){
-      const [partId, colorId] = key.split('|');
-      xml += '<ITEM>\n';
-      xml += '<ITEMTYPE>P</ITEMTYPE>\n';
-      xml += '<ITEMID>' + xmlEscape(partId) + '</ITEMID>\n';
-      xml += '<COLOR>' + xmlEscape(colorId) + '</COLOR>\n';
-      xml += '<MINQTY>' + aggregated[key] + '</MINQTY>\n';
-      xml += '</ITEM>\n';
-    });
-    xml += '</INVENTORY>';
-
-    statusLine.textContent = 'Done.';
-    convertBtn.disabled = false;
-    renderResults(rows, xml, unresolvedCount);
+    lastRun = { rows };
+    setBusy(false);
+    const retryable = rows.filter(r => r.retryable).length;
+    statusLine.textContent = retryable
+      ? 'Done — ' + retryable + ' still rate limited after ' + MAX_ATTEMPTS + ' attempts, use Retry.'
+      : 'Done.';
+    renderResults();
   });
 })();
 </script>
