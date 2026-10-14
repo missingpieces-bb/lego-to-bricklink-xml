@@ -306,10 +306,10 @@
   }
 
   // Gap between lookups. Rebrickable allows ~1 request/sec on average with a
-  // small burst allowance, so this runs fast for short lists and only
-  // occasionally trips the limit on long ones - which the backoff below
-  // handles by waiting the time Rebrickable asks for.
-  const PACE_MS = 150;
+  // small burst allowance. 500ms (~2/sec) leans on that burst allowance for
+  // speed while rarely tripping the limit; when it does, the backoff below
+  // waits the time Rebrickable asks for.
+  const PACE_MS = 500;
   // How many times one lookup is attempted when it hits a temporary error
   // (429 or network) before it's left for the user to retry by hand.
   const MAX_ATTEMPTS = 3;
