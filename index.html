@@ -206,7 +206,7 @@
 </main>
 
 <footer>
-  Runs entirely in your browser &mdash; IDs are sent only to the Rebrickable API for lookup, nothing is stored or sent anywhere else.
+  Part and colour data sourced from <a href="https://rebrickable.com" target="_blank" rel="noopener" style="color:inherit">Rebrickable</a>. Runs entirely in your browser &mdash; IDs are sent only to the Rebrickable API for lookup (at most one request per 1.1s, shared across tabs). Only your API key (if you tick &ldquo;remember&rdquo;) and rate-limit timers are saved, on this device.
 </footer>
 
 <script>
@@ -363,14 +363,65 @@
     }, left + 50);
   }
 
+  // ---- Shared request gate -------------------------------------------
+  // EVERY Rebrickable request goes through rebrickableFetch(). It enforces
+  // one request per PACE_MS across all runs, retries and open tabs of this
+  // page (tabs share localStorage and coordinate with the Web Locks API),
+  // and when any tab gets a 429 every tab waits it out.
+  const NEXT_ALLOWED_KEY = 'bricklinkConverter.nextRequestAt';
+  let memNextAllowed = 0;
+
+  function getNextAllowed(){
+    let stored = 0;
+    try{ stored = parseInt(window.localStorage.getItem(NEXT_ALLOWED_KEY) || '0', 10) || 0; }
+    catch(err){ /* storage unavailable - memory only */ }
+    return Math.max(stored, memNextAllowed);
+  }
+  // Push the next permitted request time out to `at` (never pulls it in).
+  function deferNextAllowed(at){
+    memNextAllowed = Math.max(getNextAllowed(), at);
+    try{ window.localStorage.setItem(NEXT_ALLOWED_KEY, String(memNextAllowed)); }
+    catch(err){ /* ignore */ }
+  }
+  function withApiLock(fn){
+    // Web Locks serialise the check-and-claim step between tabs; fall back
+    // to per-tab behaviour on browsers without it.
+    if (navigator.locks && navigator.locks.request){
+      return navigator.locks.request('bricklinkConverter.rebrickable', fn);
+    }
+    return fn();
+  }
+  // Resolves to { response } (a fetch promise wrapped so the lock is
+  // released as soon as the request is sent) or { blocked } if this page is
+  // in cooldown or would have to wait too long.
+  function rebrickableFetch(url){
+    return withApiLock(async function(){
+      for (;;){
+        const cool = cooldownLeftMs();
+        if (cool) return { blocked: cool };
+        const wait = getNextAllowed() - Date.now();
+        if (wait <= 0) break;
+        if (wait > MAX_INLINE_WAIT_MS) return { blocked: wait };
+        await sleep(wait);
+      }
+      deferNextAllowed(Date.now() + PACE_MS);
+      return { response: fetch(url) };
+    });
+  }
+
   async function lookupElement(elementId, apiKey){
     const url = 'https://rebrickable.com/api/v3/lego/elements/' + encodeURIComponent(elementId) + '/?key=' + encodeURIComponent(apiKey);
+    const gate = await rebrickableFetch(url);
+    if (gate.blocked){
+      return { ok:false, reason: 'Paused — rate-limit cooldown', retryable:true, halt:true, waitMs: gate.blocked, short:'paused' };
+    }
     let res;
     try{
-      res = await fetch(url);
+      res = await gate.response;
     }catch(err){
       // A blocked IP often shows up here too (no CORS headers on the error
       // page), so treat it the same as throttling.
+      deferNextAllowed(Date.now() + 2000);
       return { ok:false, reason: 'Network error contacting Rebrickable', retryable:true, waitMs: 2000, short:'network error' };
     }
     if (res.status === 401 || res.status === 403){
@@ -386,6 +437,8 @@
         const m = body && body.detail && String(body.detail).match(/(\d+)\s*second/i);
         if (m) waitMs = parseInt(m[1], 10) * 1000;
       }catch(err){ /* keep the default */ }
+      // Make every tab honour the wait, not just this lookup.
+      deferNextAllowed(Date.now() + waitMs + 1000);
       return { ok:false, reason: 'Rate limited by Rebrickable', retryable:true, waitMs, short:'rate limited' };
     }
     if (!res.ok){
@@ -415,7 +468,7 @@
     let result;
     for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++){
       result = await lookupElement(elementId, apiKey);
-      if (!result.retryable) return result;
+      if (!result.retryable || result.halt) return result;
       if (result.waitMs > MAX_INLINE_WAIT_MS || attempt === MAX_ATTEMPTS){
         result.halt = true;
         return result;
@@ -429,7 +482,10 @@
   }
 
   function haltMessage(result){
-    return 'Stopped — Rebrickable is ' + (result.short === 'rate limited' ? 'throttling requests' : 'not responding') +
+    const why = result.short === 'rate limited' ? 'Rebrickable is throttling requests'
+      : result.short === 'paused' ? 'another tab hit Rebrickable’s rate limit'
+      : 'Rebrickable is not responding';
+    return 'Stopped — ' + why +
       '. Locked for ' + formatWait(cooldownLeftMs()) + ' to avoid an IP ban; then use Retry all.';
   }
 
@@ -571,7 +627,6 @@
         }
       });
       renderResults();
-      if (n < ids.length - 1) await sleep(PACE_MS);
     }
 
     if (stop && stop.halt) setCooldown(stop.waitMs);
@@ -662,8 +717,6 @@
         if (result.halt){
           stop = result;
           setCooldown(result.waitMs);
-        } else {
-          await sleep(PACE_MS);
         }
       }
 
