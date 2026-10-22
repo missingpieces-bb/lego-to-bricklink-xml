@@ -420,7 +420,7 @@
         result.halt = true;
         return result;
       }
-      const wait = (result.waitMs + 1000) * attempt;
+      const wait = Math.max(PACE_MS, (result.waitMs + 1000) * attempt);
       statusLine.textContent = progressText + ' — ' + result.short + ', waiting ' +
         formatWait(wait) + ' before retry ' + attempt + ' of ' + (MAX_ATTEMPTS - 1) + '…';
       await sleep(wait);
